@@ -77,6 +77,7 @@ export interface ReviewerClient {
   prewarm?(): Promise<void>
   generate(input: {
     prompt: string
+    reviewerInstructions?: string
     model: ReviewModel
     parentSessionID: string
     location?: { directory?: string; workspaceID?: string }

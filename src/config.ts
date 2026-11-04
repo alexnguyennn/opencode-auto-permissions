@@ -8,6 +8,7 @@ export interface Config {
   model: ReviewModel | undefined
   modelLabel: string | undefined
   variant: string | undefined
+  reviewerInstructions: string | undefined
   timeoutMs: number
   userMessageCount: number
   shadow: boolean
@@ -25,6 +26,7 @@ export function parseConfig(options: Readonly<Record<string, unknown>>): Config 
     model,
     modelLabel: typeof modelValue === "string" ? modelValue : undefined,
     variant,
+    reviewerInstructions: parseReviewerInstructions(options.reviewerInstructions),
     timeoutMs: boundedInteger(options.timeoutMs, DEFAULT_TIMEOUT_MS, 100, 30_000, "timeoutMs"),
     userMessageCount: boundedInteger(
       options.userMessageCount,
@@ -53,6 +55,12 @@ function parseModel(value: unknown, variant: string | undefined): ReviewModel | 
   const id = value.slice(slash + 1).trim()
   if (!providerID || !id) throw new Error('Auto Permissions model must use "provider/model" form')
   return { providerID, id, ...(variant ? { variant } : {}) }
+}
+
+function parseReviewerInstructions(value: unknown): string | undefined {
+  if (value === undefined) return undefined
+  if (typeof value === "string" && value.trim() && value.trim().length <= 8_000) return value.trim()
+  throw new Error("Auto Permissions reviewerInstructions must be a non-empty string of at most 8000 characters")
 }
 
 function parseVariant(value: unknown): string | undefined {

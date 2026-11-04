@@ -101,3 +101,24 @@ To verify isolation and server startup without opening a TUI:
 bun run scripts/test-runtime.ts stable --headless
 bun run scripts/test-runtime.ts v2 --headless
 ```
+## Trusted-policy regression evaluation
+
+`test/instructions.test.ts` covers default-prompt compatibility, trusted policy
+placement, native/stateless and session compatibility transports, and legacy
+ambient-context stripping. `test/native.test.ts` also covers both cleanup incident
+shapes, authoritative hard guards, and preservation of actionable denial reasons.
+
+For semantic checks against Luna, use the local evaluation repository rather than
+the coding-agent harness (whose `--auto` path bypasses permission approval):
+
+```sh
+mise x bun@1.3.14 -- bun scripts/eval-instructions.ts --dry-run --max-calls 64 --budget-usd 1
+```
+
+The runner reads `~/bench/dev/agent-evals/fixtures/permission-reviewer-instructions`
+and writes isolated classifier records/reports under that repository's `results/`.
+Live runs additionally require a task-owned loopback OpenCode server URL/password
+in `OPENCODE_EVAL_URL`/`OPENCODE_EVAL_PASSWORD`, plus `--server-config PATH` pointing
+to its isolated Luna config with `body.max_output_tokens: 1024`. Commands in
+fixtures are inert data. The budget is a conservative list-price planning bound;
+the API may omit usage, so it is not an exact billing assertion.

@@ -462,6 +462,7 @@ async function singleModelDecision(
     try {
       structured = await Promise.race([aborted, client.generate({
         prompt: buildReviewPrompt(input),
+        ...(config.reviewerInstructions ? { reviewerInstructions: config.reviewerInstructions } : {}),
         model,
         parentSessionID: input.context.rootSessionID,
         ...(input.context.directory ? { location: { directory: input.context.directory } } : {}),

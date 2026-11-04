@@ -2,7 +2,7 @@
 
 [![release](https://img.shields.io/github/v/release/hueyexe/opencode-auto-permissions.svg)](https://github.com/hueyexe/opencode-auto-permissions/releases)
 [![npm](https://img.shields.io/npm/v/opencode-auto-permissions.svg)](https://www.npmjs.com/package/opencode-auto-permissions)
-[![tests](https://img.shields.io/badge/tests-152%20passing-brightgreen.svg)](./test)
+[![tests](https://img.shields.io/badge/tests-161%20passing-brightgreen.svg)](./test)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue.svg)](./tsconfig.json)
 [![OpenCode](https://img.shields.io/badge/OpenCode-stable%20%2B%20V2-blue.svg)](./docs/COMPATIBILITY_SPIKE.md)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -139,6 +139,7 @@ The plugin tuple accepts these options:
 | --- | --- | --- |
 | `model` | Requesting session model | Optional dedicated reviewer model in `provider/model` form. |
 | `variant` | Selected model's default | Optional reviewer-only model variant. Use `"low"` when supported for faster decisions. |
+| `reviewerInstructions` | None | Additional trusted operator policy, a non-empty string of at most 8000 characters. Applied to model reviews, including fallback attempts; deterministic decisions and explicit user prohibitions remain authoritative. |
 | `sessionApprovals` | `true` | Reuse guarded, pattern-specific approvals immediately for the current session. Set `false` for one-time approvals only. |
 | `timeoutMs` | `30000` | Per-model timeout from 100 to 30,000 milliseconds. A fallback gets its own budget, so two model attempts can take up to 60 seconds at the default (plus context/reply overhead). |
 | `userMessageCount` | `8` | Recent user messages included in review context, from 1 to 20. |
@@ -168,6 +169,47 @@ Fallback reviewer sessions are standalone rather than children of the active cod
 Concurrent identical requests share one model review. Once a narrow, non-sensitive session pattern is approved, later matching requests in the same root session are approved without another model call. Destructive operations, pushes, publishing, deployments, credential access, and broad wildcard patterns remain one-time decisions.
 
 The plugin does not force a universal reasoning level because variant names differ by provider. Omitting `variant` uses the selected model's variant. Avoid high or maximum reasoning for permission review unless your policy requires unusually complex analysis.
+
+### Reviewer-specific policy and actionable denials
+
+The stateless native reviewer does not automatically load your `AGENTS.md`, skills,
+or the main agent's explanations. Put policy intended for the reviewer in the
+server plugin's `reviewerInstructions` option. For current V2 configuration:
+
+```json
+{
+  "plugins": [{
+    "package": "opencode-auto-permissions",
+    "options": {
+      "model": "openai/gpt-6-luna",
+      "variant": "medium",
+      "reviewerInstructions": "Planning-only restrictions prohibit substantive changes, but do not by themselves prohibit disposing of verified current-task scratch artifacts after use, including disposable plan files. Approve cleanup-only requests for those artifacts. A temporary-looking path or filename alone is not proof of ownership. Do not approve unrelated or unauthorized edits bundled with cleanup, deletion of shared temporary roots, other sessions' artifacts, or user files. Explicit user prohibitions on deletion or cleanup remain authoritative. When denying a bundled request, identify the blocked substantive action and give a concrete safe next step in the reason: split verified cleanup into a standalone request and defer or separately seek authorization for the real edits. Do not promise that the split request will be approved, tell the agent to retry the identical blocked command, or abandon the task. If ownership is unclear, suggest read-only inspection or narrowing to verified task-owned artifacts. Never use allow_session for deletion."
+    }
+  }]
+}
+```
+
+Operator instructions supplement the base reviewer prompt outside the untrusted
+request payload. They are included in native/stateless requests, session-based
+compatibility requests, and the hidden legacy reviewer's system prompt. Supply
+matching server/TUI options when using older compatibility runtimes.
+
+No `nextStep` field is added: the model's existing `reason` field carries concise
+denial guidance, and the requesting agent receives it in the permission error.
+Guidance proposes a safer *new* request; it does not grant approval for that request
+or authorize unrelated edits. The 240-character reason limit is unchanged.
+
+This is not an ownership registry or a security guarantee. A temporary-looking
+path is not proof that a file belongs to the task; provide credible ownership
+context or narrow the operation. Instructions do not change OpenCode permission
+rules, hard-coded policy outcomes, or session-approval guardrails. For example,
+the deterministic root/home deletion prohibition is evaluated before any model
+call, even if operator text says to approve everything. Use actual permission
+rules for absolute prohibitions, not reviewer instructions alone.
+
+A bounded inert comparison is available in `scripts/eval-instructions.ts`; its
+canonical cases and paired results live in the local `agent-evals` repo. It never
+executes proposed commands. See `docs/TESTING.md` for the invocation.
 
 ## Compatibility
 

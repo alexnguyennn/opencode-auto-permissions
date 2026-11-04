@@ -7,6 +7,7 @@ describe("parseConfig", () => {
       model: { providerID: "cloudflare-workers-ai", id: "@cf/deepseek-ai/deepseek-v4-flash-0731" },
       modelLabel: "cloudflare-workers-ai/@cf/deepseek-ai/deepseek-v4-flash-0731",
       variant: undefined,
+      reviewerInstructions: undefined,
       timeoutMs: 30_000,
       userMessageCount: 8,
       shadow: false,
@@ -55,6 +56,15 @@ describe("parseConfig", () => {
   test("allows session approvals to be disabled", () => {
     expect(parseConfig({ model: "a/b" }).sessionApprovals).toBeTrue()
     expect(parseConfig({ model: "a/b", sessionApprovals: false }).sessionApprovals).toBeFalse()
+  })
+
+  test("accepts bounded trusted reviewer instructions", () => {
+    expect(parseConfig({ reviewerInstructions: "  Split cleanup from unrelated edits.\n" }).reviewerInstructions)
+      .toBe("Split cleanup from unrelated edits.")
+    expect(parseConfig({ reviewerInstructions: "x".repeat(8_000) }).reviewerInstructions).toHaveLength(8_000)
+    for (const reviewerInstructions of ["", "  ", false, 42, {}, [], "x".repeat(8_001)]) {
+      expect(() => parseConfig({ reviewerInstructions })).toThrow(/reviewerInstructions/)
+    }
   })
 
   test("enables bounded diagnostics with a default or explicit path", () => {

@@ -1,5 +1,5 @@
 import type { ReviewModel, ReviewerClient } from "./types.ts"
-import { DECISION_SCHEMA, REVIEWER_AGENT_ID, REVIEWER_SYSTEM_PROMPT } from "./agent.ts"
+import { buildReviewerSystemPrompt, DECISION_SCHEMA, REVIEWER_AGENT_ID } from "./agent.ts"
 import { mkdir } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -36,6 +36,7 @@ export class OpenCodeClientAdapter implements ReviewerClient {
 
   async generate(input: {
     prompt: string
+    reviewerInstructions?: string
     model: ReviewModel
     parentSessionID: string
     location?: { directory?: string; workspaceID?: string }
@@ -88,6 +89,7 @@ export class OpenCodeClientAdapter implements ReviewerClient {
       sessionID = created.id
 
       const promptBody = {
+        ...(input.reviewerInstructions ? { system: buildReviewerSystemPrompt(input.reviewerInstructions) } : {}),
         model: { providerID: input.model.providerID, modelID: input.model.id },
         variant: input.model.variant,
         agent: REVIEWER_AGENT_ID,
@@ -182,6 +184,7 @@ export class OpenCodeClientAdapter implements ReviewerClient {
 
   private async generateCurrent(input: {
     prompt: string
+    reviewerInstructions?: string
     model: ReviewModel
     signal: AbortSignal
   }): Promise<unknown> {
@@ -201,7 +204,10 @@ export class OpenCodeClientAdapter implements ReviewerClient {
       }, { signal: input.signal })
       if (!isRecord(session) || typeof session.id !== "string") throw new Error("OpenCode failed to create a reviewer session")
       sessionID = session.id
-      const strictPrompt = `${input.prompt}\n\nReturn only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`
+      const prompt = input.reviewerInstructions
+        ? `${buildReviewerSystemPrompt(input.reviewerInstructions)}\n\n${input.prompt}`
+        : input.prompt
+      const strictPrompt = `${prompt}\n\nReturn only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`
       const result = await this.client.session.generate({ sessionID, prompt: strictPrompt }, { signal: input.signal })
       if (!isRecord(result) || typeof result.text !== "string") throw new Error("OpenCode reviewer returned no text output")
       return JSON.parse(result.text)
@@ -225,10 +231,10 @@ export type TextGenerator = (
  */
 export async function generateStatelessDecision(
   generateText: TextGenerator,
-  input: { prompt: string; model: ReviewModel; signal: AbortSignal },
+  input: { prompt: string; model: ReviewModel; signal: AbortSignal; reviewerInstructions?: string },
 ): Promise<unknown> {
   if (input.signal.aborted) throw abortError(input.signal.reason)
-  const strictPrompt = `${REVIEWER_SYSTEM_PROMPT}\n\n${input.prompt}\n\nReturn only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`
+  const strictPrompt = `${buildReviewerSystemPrompt(input.reviewerInstructions)}\n\n${input.prompt}\n\nReturn only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`
   const result = unwrapData(await generateText({ prompt: strictPrompt, model: input.model }, { signal: input.signal }))
   if (!isRecord(result) || typeof result.text !== "string") {
     throw new Error("OpenCode reviewer returned no text output")
