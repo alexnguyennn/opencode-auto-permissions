@@ -4,7 +4,8 @@ The plugin detects the runtime protocol automatically. Users do not choose a
 V1 or V2 mode:
 
 - stable OpenCode permission events are handled by the server adapter;
-- V2 permission events are handled by the TUI adapter.
+- V2 permission requests are resolved by the server's native `evaluate` hook
+  when the runtime provides it, and by the TUI adapter otherwise.
 
 The commands below choose which OpenCode executable to launch for testing;
 they do not configure the plugin's runtime behavior.

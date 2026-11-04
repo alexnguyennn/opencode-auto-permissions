@@ -94,3 +94,13 @@ target sub-1.5-second P95 UX.
   still running the prompt is delivered with `delivery: "steer"` so the
   feedback lands mid-turn; once idle it is admitted with `resume: true`.
   Resume outcomes are recorded as `resumed`/`resume_failed` diagnostics.
+- Current V2 builds (confirmed on 2.2.5) expose `ctx.permission.hook("evaluate")` on
+  the server plugin context. The hook runs before the permission is broadcast
+  and may change `effect` (`allow`, `deny`, `ask`) and `message`, so the server
+  resolves the request once for every connected client. The plugin
+  feature-detects the hook, `ctx.session.context`/`get`, and stateless
+  `generate.text` (preferring `ctx.experimental.generate.text`); when any is
+  missing the TUI adapter remains the reviewer. The hook carries no reusable
+  `always`/`save` pattern, so session approvals are limited to exact repeats
+  held in memory, and the TUI-side reply/resume path is not used (the deny
+  message reaches the agent through the rejected permission).

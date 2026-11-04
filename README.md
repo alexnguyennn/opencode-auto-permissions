@@ -2,7 +2,7 @@
 
 [![release](https://img.shields.io/github/v/release/hueyexe/opencode-auto-permissions.svg)](https://github.com/hueyexe/opencode-auto-permissions/releases)
 [![npm](https://img.shields.io/npm/v/opencode-auto-permissions.svg)](https://www.npmjs.com/package/opencode-auto-permissions)
-[![tests](https://img.shields.io/badge/tests-108%20passing-brightgreen.svg)](./test)
+[![tests](https://img.shields.io/badge/tests-152%20passing-brightgreen.svg)](./test)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue.svg)](./tsconfig.json)
 [![OpenCode](https://img.shields.io/badge/OpenCode-stable%20%2B%20V2-blue.svg)](./docs/COMPATIBILITY_SPIKE.md)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -25,7 +25,7 @@ That is the complete plugin installation. You do not need to clone this reposito
 
 OpenCode downloads the package, detects its separate server and TUI targets, and registers `opencode-auto-permissions` in your global plugin configuration (`~/.config/opencode/opencode.json` on current builds; older V2 betas also added a TUI entry to `~/.config/opencode/cli.json`).
 
-Quit and restart OpenCode after installation because configuration is loaded at startup. Auto Permissions automatically uses the model and variant selected by the session that requested the action. It also detects whether the server or TUI integration owns permission review, so only one reviewer handles each request.
+Quit and restart OpenCode after installation because configuration is loaded at startup. Auto Permissions automatically uses the model and variant selected by the session that requested the action. It also detects whether the server (including the native V2 hook) or the TUI integration owns permission review, so only one reviewer handles each request.
 
 ## Configure Permissions
 
@@ -84,17 +84,30 @@ For each supported permission request, Auto Permissions combines deterministic s
 - Broad boundary globs such as `/tmp/*` are not treated as the requested scope when the tool input identifies a precise target; the reviewer evaluates the actual operation and latest user request.
 - The reviewer is tuned for unattended agents: it defaults to approval when an action reasonably serves the task and uses `ask` only as a last resort.
 - If a dedicated reviewer model times out, errors, or returns an invalid decision, the plugin tries the requesting session's model once, preserving that session model's variant. It does not retry the same provider/model, and a valid denial never triggers fallback. If no fallback is available or both attempts fail, the request is rejected automatically and the main agent receives guidance to continue with a narrower or lower-risk step.
-- Reviewer sessions are hidden, have no tools, and deny all permissions.
+- Native server review uses stateless generation and creates no session. Fallback reviewer sessions are hidden, have no tools, and deny all permissions.
 - Only a small, recent window of relevant user context is sent for review.
 - Plugin-authored denial continuations are excluded from that context so an earlier verdict cannot become a self-reinforcing human instruction.
 
 The reviewer never receives authority to execute the requested action. It always resolves the request by approving once, approving narrow matching requests for the current session, or rejecting with an actionable reason. Session approvals are held in memory by OpenCode and do not persist to later sessions.
 
-Reviewer sessions are standalone and deleted after each decision or failure. Startup never deletes reviewer sessions because multiple OpenCode processes may be reviewing permissions concurrently; one process must not delete another process's active review.
+Where native server review is unavailable, reviewer sessions are standalone and deleted after each decision or failure. Startup never deletes reviewer sessions because multiple OpenCode processes may be reviewing permissions concurrently; one process must not delete another process's active review.
 
 Auto Permissions never asks the user to resolve a permission prompt. When the reviewer cannot safely approve, it denies and tells the coding agent why, what safer alternative to try, and to continue autonomously where possible.
 
 Denial and failure continuations preserve the main session's selected agent, model, and variant. A permission decision does not reset the primary agent's reasoning effort.
+
+### Native Server Review (current V2)
+
+Current V2 runtimes expose a server-side `permission.hook("evaluate")` seam that runs before a pending permission is broadcast. When it is available, the server plugin reviews `ask` requests itself, once per request, using stateless `generate.text` (the newer `experimental.generate.text` alias is preferred when present), and sets the request to allow or deny before any TUI, web, or remote client sees it. No TUI plugin entry, reviewer session, hidden agent, tools, or skills are involved; the reviewer instructions travel in the prompt.
+
+The native path reuses the same engine as the compatibility path: deterministic prohibition and catastrophic-delete rules, the requested model and variant (falling back to the requesting session's model once, never retrying the same model or a valid denial), `timeoutMs`, `shadow`, concurrent-review sharing, and the `sessionApprovals` guardrails. Differences and known limits:
+
+- The model is the one running the requesting turn, then the session's selected model, unless `model` is configured.
+- The hook offers no reusable `always`/`save` patterns, so an `allow_session` verdict is remembered in plugin memory only for a repeat of the exact same resources in the same root session, and only when the guardrails below permit it. Nothing is written to OpenCode's persisted permission rules.
+- Rejections reach the agent as the permission's deny message; no follow-up prompt is admitted, and no toast is shown.
+- Review failures fail closed (deny). Shutting the plugin down cancels in-flight reviews and leaves those requests as `ask`.
+- With `shadow: true` the request stays `ask`, so a TUI plugin entry on the same runtime would also observe it and log a second shadow record.
+- Runtimes without the hook or stateless generation keep using the TUI plugin (reviewer sessions on older builds). Keep the TUI entry only for those runtimes.
 
 ### Session Approvals
 
@@ -150,7 +163,7 @@ With `debug: true`, diagnostics are written to `$XDG_STATE_HOME/opencode/auto-pe
 
 Access to this bounded diagnostics file is deterministically allowed by the plugin so troubleshooting cannot be blocked by speculative sensitivity concerns. This exception applies only to Auto Permissions' own `decisions.jsonl` path.
 
-Reviewer sessions are standalone rather than children of the active coding session. This keeps reviewer model and variant state isolated from the main agent and its displayed reasoning level.
+Fallback reviewer sessions are standalone rather than children of the active coding session. This keeps reviewer model and variant state isolated from the main agent and its displayed reasoning level.
 
 Concurrent identical requests share one model review. Once a narrow, non-sensitive session pattern is approved, later matching requests in the same root session are approved without another model call. Destructive operations, pushes, publishing, deployments, credential access, and broad wildcard patterns remain one-time decisions.
 
@@ -163,7 +176,7 @@ The compatibility baseline was acceptance-tested in the real TUI with:
 - OpenCode stable `1.18.12`
 - OpenCode V2 `0.0.0-beta-202608110357`
 
-Newer V2 builds (September 2026 and later) renamed the permission event payloads (`permission.v2.asked` back to `permission.asked`, and the reusable-pattern field from `always` to `save`); the plugin accepts both shapes. The runtime protocol is detected automatically; stable permission events are handled by the server adapter and V2 events by the TUI adapter. See the [compatibility notes](docs/COMPATIBILITY_SPIKE.md) for implementation evidence and known protocol differences.
+Newer V2 builds (September 2026 and later) renamed the permission event payloads (`permission.v2.asked` back to `permission.asked`, and the reusable-pattern field from `always` to `save`); the plugin accepts both shapes. The runtime protocol is detected automatically; stable permission events are handled by the server adapter. V2 events are handled by the server's native `evaluate` hook when the runtime has it, and otherwise by the TUI adapter. See the [compatibility notes](docs/COMPATIBILITY_SPIKE.md) for implementation evidence and known protocol differences.
 
 ## Development
 

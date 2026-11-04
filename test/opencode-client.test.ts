@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { REVIEWER_SYSTEM_PROMPT } from "../src/agent.ts"
 import { OpenCodeClientAdapter } from "../src/opencode-client.ts"
 
 describe("OpenCodeClientAdapter", () => {
@@ -45,6 +46,57 @@ describe("OpenCodeClientAdapter", () => {
       model: { providerID: "example", id: "luna-5.6" },
     })
     expect(calls[3]?.input).toEqual({ sessionID: "ses_parent", requestID: "per_1", decision: "once" })
+  })
+
+  test("prefers stateless text generation without touching sessions", async () => {
+    const calls: Array<{ input: any; options: any }> = []
+    const sessionCalls: string[] = []
+    const adapter = new OpenCodeClientAdapter({
+      generate: {
+        text: async function (this: unknown, input: any, options: any) {
+          expect(this).toBe((adapter as any).client.generate)
+          calls.push({ input, options })
+          return { text: '```json\n{"decision":"allow","reasonCode":"safe","reason":"Safe operation."}\n```' }
+        },
+      },
+      app: { agents: async () => sessionCalls.push("agents"), skills: async () => sessionCalls.push("skills") },
+      permission: { request: { list: async () => ({ data: [] }) } },
+      session: {
+        create: async () => sessionCalls.push("create"),
+        generate: async () => sessionCalls.push("generate"),
+      },
+    })
+    const signal = new AbortController().signal
+
+    await adapter.prewarm()
+    await expect(adapter.generate({
+      prompt: "review this",
+      model: { providerID: "example", id: "main", variant: "none" },
+      parentSessionID: "ses_parent",
+      signal,
+    })).resolves.toEqual({ decision: "allow", reasonCode: "safe", reason: "Safe operation." })
+
+    expect(sessionCalls).toEqual([])
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.input.model).toEqual({ providerID: "example", id: "main", variant: "none" })
+    expect(calls[0]!.input.prompt).toContain(REVIEWER_SYSTEM_PROMPT)
+    expect(calls[0]!.input.prompt).toContain("review this")
+    expect(calls[0]!.options).toEqual({ signal })
+  })
+
+  test("stateless generation rejects aborted, empty, and non-JSON responses", async () => {
+    const respond = (value: unknown) => new OpenCodeClientAdapter({ generate: { text: async () => value } })
+    const input = {
+      prompt: "review",
+      model: { providerID: "example", id: "main" },
+      parentSessionID: "ses_parent",
+      signal: new AbortController().signal,
+    }
+    const aborted = new AbortController()
+    aborted.abort("permission resolved")
+    await expect(respond({ text: "{}" }).generate({ ...input, signal: aborted.signal })).rejects.toThrow("permission resolved")
+    await expect(respond({}).generate(input)).rejects.toThrow("no text output")
+    await expect(respond({ text: "I approve" }).generate(input)).rejects.toThrow("invalid response")
   })
 
   test("prewarms the reviewer location without invoking a model", async () => {

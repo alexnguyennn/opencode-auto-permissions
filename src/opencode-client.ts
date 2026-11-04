@@ -1,5 +1,5 @@
 import type { ReviewModel, ReviewerClient } from "./types.ts"
-import { DECISION_SCHEMA, REVIEWER_AGENT_ID } from "./agent.ts"
+import { DECISION_SCHEMA, REVIEWER_AGENT_ID, REVIEWER_SYSTEM_PROMPT } from "./agent.ts"
 import { mkdir } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -15,6 +15,8 @@ export class OpenCodeClientAdapter implements ReviewerClient {
   constructor(private readonly client: any) {}
 
   async prewarm(): Promise<void> {
+    // Stateless generation needs no reviewer session, agent, or skill state.
+    if (typeof this.client.generate?.text === "function") return
     await mkdir(REVIEWER_DIRECTORY, { recursive: true })
     const location = { directory: REVIEWER_DIRECTORY }
     const requests: Promise<unknown>[] = []
@@ -39,6 +41,9 @@ export class OpenCodeClientAdapter implements ReviewerClient {
     location?: { directory?: string; workspaceID?: string }
     signal: AbortSignal
   }): Promise<unknown> {
+    if (typeof this.client.generate?.text === "function") {
+      return generateStatelessDecision((request, options) => this.client.generate.text(request, options), input)
+    }
     if (typeof this.client.permission?.request?.list === "function") return this.generateCurrent(input)
     const stable = typeof this.client.postSessionIdPermissionsPermissionId === "function"
     const session = stable ? this.client.session : (this.client.v2?.session ?? this.client.session)
@@ -204,6 +209,39 @@ export class OpenCodeClientAdapter implements ReviewerClient {
       input.signal.removeEventListener("abort", abortRemote)
       if (sessionID) await Promise.resolve(this.client.session.remove({ sessionID })).catch(() => undefined)
     }
+  }
+}
+
+/** Stateless text generation entry point shared by the TUI client and native server context. */
+export type TextGenerator = (
+  input: { prompt: string; model: ReviewModel },
+  options: { signal: AbortSignal },
+) => Promise<unknown>
+
+/**
+ * Reviews with a single stateless text generation: no reviewer session,
+ * agent, tools, or skills exist, so the reviewer instructions travel in the
+ * prompt itself.
+ */
+export async function generateStatelessDecision(
+  generateText: TextGenerator,
+  input: { prompt: string; model: ReviewModel; signal: AbortSignal },
+): Promise<unknown> {
+  if (input.signal.aborted) throw abortError(input.signal.reason)
+  const strictPrompt = `${REVIEWER_SYSTEM_PROMPT}\n\n${input.prompt}\n\nReturn only one JSON object without Markdown fences with exactly these keys: "decision" ("allow", "allow_session", or "deny"), "reasonCode" (lower_snake_case), and "reason" (one sentence).`
+  const result = unwrapData(await generateText({ prompt: strictPrompt, model: input.model }, { signal: input.signal }))
+  if (!isRecord(result) || typeof result.text !== "string") {
+    throw new Error("OpenCode reviewer returned no text output")
+  }
+  return parseJsonObject(result.text)
+}
+
+function parseJsonObject(text: string): unknown {
+  const unfenced = text.trim().replace(/^```(?:json)?\s*([\s\S]*?)\s*```$/i, "$1")
+  try {
+    return JSON.parse(unfenced)
+  } catch {
+    throw new Error("OpenCode reviewer returned an invalid response")
   }
 }
 

@@ -97,7 +97,7 @@ export async function collectReviewInput(
   }
 }
 
-function latestUserModel(messages: unknown[]): ReviewModel | undefined {
+export function latestUserModel(messages: unknown[]): ReviewModel | undefined {
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index]
     if (!isRecord(message)) continue

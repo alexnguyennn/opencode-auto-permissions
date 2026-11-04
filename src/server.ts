@@ -1,6 +1,7 @@
 import { Plugin as V2Plugin } from "@opencode-ai/plugin"
 import { REVIEWER_AGENT_ID, REVIEWER_SYSTEM_PROMPT } from "./agent.ts"
 import { parseConfig } from "./config.ts"
+import { installNativeReviewer } from "./native.ts"
 import { installReviewer } from "./reviewer.ts"
 import { createStableRuntime, protocolForVersion } from "./stable.ts"
 
@@ -19,6 +20,10 @@ const v2Plugin = V2Plugin.define({
         agent.permissions = [{ action: "*", resource: "*", effect: "deny" }]
       })
     })
+    // Current V2 runtimes let the server resolve "ask" requests before any
+    // client sees them. Older V2 betas lack the hook; there this returns
+    // undefined and the TUI plugin remains the reviewer.
+    return await installNativeReviewer(context)
   },
 })
 

@@ -12,6 +12,7 @@ import type {
   Decision,
   PermissionProtocol,
   PermissionRequest,
+  ReviewInput,
   ReviewModel,
   ReviewerClient,
   RuntimeContext,
@@ -30,9 +31,7 @@ export function installReviewer(context: RuntimeContext, overrides: ReviewerOver
   const config = parseConfig(context.options)
   const client = overrides.client ?? new OpenCodeClientAdapter(context.client)
   const inFlight = new Map<string, AbortController>()
-  const sharedReviews = new Map<string, Promise<Decision>>()
-  const sessionApprovals = new Set<string>()
-  const sharedReviewController = new AbortController()
+  const state = createReviewState()
   const configuredProtocols: PermissionProtocol[] = overrides.protocols ?? ["stable", "v2"]
   const protocols = new Set(configuredProtocols)
   writeDiagnostic(config.diagnosticsPath, {
@@ -59,7 +58,7 @@ export function installReviewer(context: RuntimeContext, overrides: ReviewerOver
     const startedAt = performance.now()
     writeReceived(config, asked)
     inFlight.set(asked.id, controller)
-    void reviewAndReply(context, client, config, asked, controller.signal, overrides, startedAt, sharedReviews, sessionApprovals, sharedReviewController.signal)
+    void reviewAndReply(context, client, config, asked, controller.signal, overrides, startedAt, state)
       .catch(async (error) => {
         if (controller.signal.aborted) return
         await rejectAfterFailure(context, client, config, asked, startedAt, error, overrides)
@@ -79,7 +78,7 @@ export function installReviewer(context: RuntimeContext, overrides: ReviewerOver
     const startedAt = performance.now()
     writeReceived(config, asked)
     inFlight.set(asked.id, controller)
-    void reviewAndReply(context, client, config, asked, controller.signal, overrides, startedAt, sharedReviews, sessionApprovals, sharedReviewController.signal)
+    void reviewAndReply(context, client, config, asked, controller.signal, overrides, startedAt, state)
       .catch(async (error) => {
         if (controller.signal.aborted) return
         await rejectAfterFailure(context, client, config, asked, startedAt, error, overrides)
@@ -95,10 +94,8 @@ export function installReviewer(context: RuntimeContext, overrides: ReviewerOver
     offReplied()
     offStableReplied()
     for (const controller of inFlight.values()) controller.abort("plugin disposed")
-    sharedReviewController.abort("plugin disposed")
+    disposeReviewState(state)
     inFlight.clear()
-    sharedReviews.clear()
-    sessionApprovals.clear()
   }
 }
 
@@ -110,41 +107,19 @@ async function reviewAndReply(
   parentSignal: AbortSignal,
   overrides: ReviewerOverrides,
   startedAt: number,
-  sharedReviews: Map<string, Promise<Decision>>,
-  sessionApprovals: Set<string>,
-  sharedReviewSignal: AbortSignal,
+  state: ReviewState,
 ): Promise<void> {
   const input = await collectReviewInput(context, request, config.userMessageCount)
   if (parentSignal.aborted) return
 
-  const policyDecision = applyDeterministicPolicy(input)
-  const approvalKey = reusableApprovalKey(config, request, input)
-  const cachedDecision = !policyDecision && approvalKey && sessionApprovals.has(approvalKey)
-    ? {
-        kind: "allow" as const,
-        reasonCode: "session_approval_reused",
-        reason: "Reuses an approved narrow pattern from this session.",
-      }
-    : undefined
-  const reviewKey = concurrentReviewKey(request, input)
-  let shared = sharedReviews.get(reviewKey)
-  if (!policyDecision && !cachedDecision && !shared) {
-    shared = modelDecision(context, client, config, input, sharedReviewSignal)
-    sharedReviews.set(reviewKey, shared)
-    void shared.finally(() => {
-      if (sharedReviews.get(reviewKey) === shared) sharedReviews.delete(reviewKey)
-    }).catch(() => undefined)
-  }
-  const decision = policyDecision ?? cachedDecision ?? (await shared!)
+  const { decision, source, approvalKey } = await decideReview(client, config, request, input, state)
   if (parentSignal.aborted) return
 
-  if (approvalKey && (decision.kind === "allow" || decision.kind === "allow_session")) {
-    sessionApprovals.add(approvalKey)
-  }
+  rememberApproval(state, approvalKey, decision)
 
   overrides.onDecision?.(request, decision, config.shadow)
   if (config.shadow) {
-    writeDecision(config, request, startedAt, decision, decisionSource(policyDecision, cachedDecision))
+    writeDecision(config, request, startedAt, decision, source)
     return
   }
 
@@ -166,7 +141,7 @@ async function reviewAndReply(
       request,
       startedAt,
       decision,
-      decisionSource(policyDecision, cachedDecision),
+      source,
       result,
       reply === "always" ? "session" : "once",
     )
@@ -177,11 +152,11 @@ async function reviewAndReply(
     sessionID: request.sessionID,
     requestID: request.id,
     reply: "reject",
-    message: `Auto Permissions blocked this action: ${decision.reason}`,
+    message: blockedMessage(decision.reason),
     protocol: request.protocol,
   })
   context.showToast?.({ title: "Blocked", message: decision.reason, variant: "warning", duration: 4_000 })
-  writeDecision(config, request, startedAt, decision, decisionSource(policyDecision, cachedDecision), result)
+  writeDecision(config, request, startedAt, decision, source, result)
   if (result === "replied") context.resumeAfterDenial?.(request.sessionID, decision.reason)
 }
 
@@ -198,25 +173,102 @@ async function rejectAfterFailure(
   overrides.onFailure?.(request, error)
   if (config.shadow || !(await isRequestPending(context, request))) return
 
-  const category = failureCategory(error)
-  const reason = category === "timeout"
-    ? "Permission review timed out, so the action was blocked; continue with a narrower or lower-risk step and retry only if needed."
-    : "Permission review failed, so the action was blocked; continue with a narrower or lower-risk step and retry only if needed."
+  const reason = failureReason(error)
   const result = await client.reply({
     sessionID: request.sessionID,
     requestID: request.id,
     reply: "reject",
-    message: `Auto Permissions blocked this action: ${reason}`,
+    message: blockedMessage(reason),
     protocol: request.protocol,
   })
   context.showToast?.({ title: "Blocked", message: reason, variant: "warning", duration: 4_000 })
   if (result === "replied") context.resumeAfterDenial?.(request.sessionID, reason)
 }
 
+/**
+ * Per-installation review state shared by the legacy event path and the
+ * native server hook: in-flight identical reviews, in-memory session
+ * approvals, and a signal that cancels outstanding model calls on disposal.
+ */
+export interface ReviewState {
+  sharedReviews: Map<string, Promise<Decision>>
+  sessionApprovals: Set<string>
+  controller: AbortController
+}
+
+export interface ReviewOutcome {
+  decision: Decision
+  source: "policy" | "model" | "session"
+  approvalKey: string | undefined
+}
+
+export function createReviewState(): ReviewState {
+  return { sharedReviews: new Map(), sessionApprovals: new Set(), controller: new AbortController() }
+}
+
+export function disposeReviewState(state: ReviewState): void {
+  state.controller.abort("plugin disposed")
+  state.sharedReviews.clear()
+  state.sessionApprovals.clear()
+}
+
+/**
+ * Applies deterministic policy, then reusable in-session approvals, then one
+ * shared model review per identical concurrent request.
+ */
+export async function decideReview(
+  client: Pick<ReviewerClient, "generate">,
+  config: Config,
+  request: PermissionRequest,
+  input: ReviewInput,
+  state: ReviewState,
+): Promise<ReviewOutcome> {
+  const policyDecision = applyDeterministicPolicy(input)
+  const approvalKey = reusableApprovalKey(config, request, input)
+  const cachedDecision = !policyDecision && approvalKey && state.sessionApprovals.has(approvalKey)
+    ? {
+        kind: "allow" as const,
+        reasonCode: "session_approval_reused",
+        reason: "Reuses an approved narrow pattern from this session.",
+      }
+    : undefined
+  const reviewKey = concurrentReviewKey(request, input)
+  let shared = state.sharedReviews.get(reviewKey)
+  if (!policyDecision && !cachedDecision && !shared) {
+    shared = modelDecision(client, config, input, state.controller.signal)
+    state.sharedReviews.set(reviewKey, shared)
+    void shared.finally(() => {
+      if (state.sharedReviews.get(reviewKey) === shared) state.sharedReviews.delete(reviewKey)
+    }).catch(() => undefined)
+  }
+  const decision = policyDecision ?? cachedDecision ?? (await shared!)
+  return {
+    decision,
+    source: policyDecision ? "policy" : cachedDecision ? "session" : "model",
+    approvalKey,
+  }
+}
+
+export function rememberApproval(state: ReviewState, approvalKey: string | undefined, decision: Decision): void {
+  if (approvalKey && (decision.kind === "allow" || decision.kind === "allow_session")) {
+    state.sessionApprovals.add(approvalKey)
+  }
+}
+
+export function failureReason(error: unknown): string {
+  return failureCategory(error) === "timeout"
+    ? "Permission review timed out, so the action was blocked; continue with a narrower or lower-risk step and retry only if needed."
+    : "Permission review failed, so the action was blocked; continue with a narrower or lower-risk step and retry only if needed."
+}
+
+export function blockedMessage(reason: string): string {
+  return `Auto Permissions blocked this action: ${reason}`
+}
+
 function eligibleForSessionApproval(
   config: Config,
   request: PermissionRequest,
-  input: Awaited<ReturnType<typeof collectReviewInput>>,
+  input: ReviewInput,
 ): boolean {
   if (!config.sessionApprovals || request.always.length === 0) return false
   if (request.always.some((pattern) => isBroadPattern(pattern))) return false
@@ -234,7 +286,7 @@ function eligibleForSessionApproval(
 function reusableApprovalKey(
   config: Config,
   request: PermissionRequest,
-  input: Awaited<ReturnType<typeof collectReviewInput>>,
+  input: ReviewInput,
 ): string | undefined {
   if (!eligibleForSessionApproval(config, request, input)) return undefined
   return JSON.stringify([input.context.rootSessionID, request.action, request.always])
@@ -242,16 +294,9 @@ function reusableApprovalKey(
 
 function concurrentReviewKey(
   request: PermissionRequest,
-  input: Awaited<ReturnType<typeof collectReviewInput>>,
+  input: ReviewInput,
 ): string {
   return JSON.stringify([input.context.rootSessionID, request.action, request.resources, input.request.toolInput])
-}
-
-function decisionSource(
-  policyDecision: Decision | null,
-  cachedDecision: Decision | undefined,
-): "policy" | "model" | "session" {
-  return policyDecision ? "policy" : cachedDecision ? "session" : "model"
 }
 
 function isBroadPattern(pattern: string): boolean {
@@ -265,7 +310,7 @@ function isSensitiveTarget(value: string): boolean {
   return /(?:^|[\\/])(?:\.ssh|\.aws|\.gnupg|Keychains?|credentials?|tokens?)(?:[\\/]|$)|(?:^|[\\/])\.env(?:\.|$)/i.test(value)
 }
 
-function writeDecision(
+export function writeDecision(
   config: Config,
   request: PermissionRequest,
   startedAt: number,
@@ -293,7 +338,7 @@ function writeDecision(
   })
 }
 
-function writeFailure(config: Config, request: PermissionRequest, startedAt: number, error: unknown): void {
+export function writeFailure(config: Config, request: PermissionRequest, startedAt: number, error: unknown): void {
   const described = describeError(error)
   writeDiagnostic(config.diagnosticsPath, {
     timestamp: new Date().toISOString(),
@@ -313,7 +358,7 @@ function writeFailure(config: Config, request: PermissionRequest, startedAt: num
   })
 }
 
-function writeReceived(config: Config, request: PermissionRequest): void {
+export function writeReceived(config: Config, request: PermissionRequest): void {
   writeDiagnostic(config.diagnosticsPath, {
     timestamp: new Date().toISOString(),
     event: "request_received",
@@ -337,10 +382,9 @@ function cancelReview(config: Config, inFlight: Map<string, AbortController>, re
 }
 
 async function modelDecision(
-  context: RuntimeContext,
-  client: ReviewerClient,
+  client: Pick<ReviewerClient, "generate">,
   config: Config,
-  input: Awaited<ReturnType<typeof collectReviewInput>>,
+  input: ReviewInput,
   parentSignal: AbortSignal,
 ): Promise<Decision> {
   const inheritedModel = input.context.model
@@ -396,9 +440,9 @@ async function modelDecision(
  * primary does not consume the fallback's window.
  */
 async function singleModelDecision(
-  client: ReviewerClient,
+  client: Pick<ReviewerClient, "generate">,
   config: Config,
-  input: Awaited<ReturnType<typeof collectReviewInput>>,
+  input: ReviewInput,
   parentSignal: AbortSignal,
   model: ReviewModel,
 ): Promise<Decision> {
